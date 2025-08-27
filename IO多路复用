@@ -1,0 +1,126 @@
+为了节省资源和避免线程间频繁的切换，从而提高系统效率，因此考虑IO多路复用技术。
+
+常见的IO多路复用技术有：
+select、poll、epoll
+
+一、select
+可以监听1024个fd，出现需求后需要一个个查具体的fd事件
+
+int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout);
+nfds：所有监控的文件描述符中最大值+1
+readfds：关注可读的文件描述符集合
+writefds：关注可写的文件描述符集合
+exceptfds：关注异常的文件描述符集合
+timeout：等待超时时间（0立即返回，NULL永远等待）
+
+
+注：select和 while循环read fd有什么区别？
+
+1、while read fd
+阻塞方式：如果 fd 没有数据，read 会阻塞，导致程序卡在某个 fd 上，不能及时处理其他 fd。
+非阻塞方式：如果 fd 设置为 O_NONBLOCK，read 没数据会立刻返回 -1 并设置 errno=EAGAIN，但这时你会不停地轮询，浪费大量 CPU（俗称“忙等”或“死循环”）。
+缺点：
+效率低下：尤其是在大部分 fd 都没数据时，CPU 大量时间都在无效轮询。
+扩展性差：fd 数量多时更明显。
+响应不及时：如果某个 fd 数据到来但你还没轮到它，响应会延迟。
+
+2、 select + read 方式
+用 select，先判断哪些 fd 有数据，再 read。
+优点：
+阻塞等待：select 会阻塞，直到有至少一个 fd 就绪（有数据可读）。
+高效：只有有数据的 fd 才会被 read，不会白白消耗 CPU。
+扩展性更好：虽然 select 本身有 fd 数量限制（一般1024），但比轮询好多了。
+及时响应：有数据就能立刻处理。
+
+特别注意：如果只有一个 fd，select 和直接 read 差别不大。
+
+二、poll
+无限制数量fd的监听，也是有通知事件之后需要一个个查fd事件
+
+int poll(struct pollfd *fds, nfds_t nfds, int timeout);
+
+fds: 指向 struct pollfd 结构体数组的指针，数组中每个元素监视一个文件描述符及其关心的事件。
+nfds: fds 数组的元素个数。
+timeout: 等待 I/O 事件发生的最长时间（毫秒为单位）。
+0: 等待指定毫秒数。
+
+返回值：
+0: 立即返回，无论是否有事件就绪（轮询）。
+-1: 无限等待直到有事件发生为止。
+
+select和poll的区别：
+fd 数量限制：select 受限于 FD_SETSIZE（通常 1024），而 poll 没有这个限制（只受限于系统资源）。
+事件表示方式：select 用位向量，poll 用结构体数组。
+大规模 fd 性能：poll 不会像 select 那样随着 fd 值增大而效率降低，但本质上两者都是线性扫描。
+高效替代：在 Linux 下，epoll 进一步提升了高并发场景的效率。
+
+
+
+三、epoll
+超级监控系统，不仅监听无限制数量的fd，还能直接通知对应fd发生的事件。
+
+事件驱动：内核维护一个就绪事件列表，只有发生变化的 fd 才会被通知，避免了每次全量轮询。
+支持水平触发（LT）和边缘触发（ET）：ET 模式只在状态变化时通知，适合非阻塞高性能场景。
+
+
+主要函数：
+1、 epoll_create / epoll_create1
+创建一个 epoll 实例，返回一个 epoll 实例的文件描述符。
+
+#include <sys/epoll.h>
+
+int epoll_create(int size);
+int epoll_create1(int flags); // 推荐使用
+size：建议值（历史遗留，>0即可）。
+flags：如 EPOLL_CLOEXEC。
+返回值：成功返回 epoll 文件描述符，失败返回 -1。
+
+2、epoll_ctl
+向 epoll 实例注册、修改或删除要监听的 fd 及其事件。
+
+int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
+epfd：epoll_create 返回的 epoll fd。
+op：
+EPOLL_CTL_ADD：注册 fd 到 epoll；
+EPOLL_CTL_MOD：修改已注册 fd 的监听事件；
+EPOLL_CTL_DEL：删除 fd。
+fd：要操作的文件描述符。
+event：监听的事件类型（添加/修改时必填，删除时可为 NULL）。
+struct epoll_event:
+
+typedef union epoll_data {
+    void        *ptr;
+    int          fd;
+    uint32_t     u32;
+    uint64_t     u64;
+} epoll_data_t;
+
+struct epoll_event {
+    uint32_t     events; // 事件类型
+    epoll_data_t data;   // 用户数据（常用 fd）
+};
+
+3、epoll_wait
+等待 epoll 实例上注册的事件发生。
+
+int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout);
+epfd：epoll 文件描述符。
+events：输出参数，保存发生的事件数组。
+maxevents：events 数组容量（必须 > 0）。
+timeout：
+0：等待指定毫秒数；
+
+0：立即返回；
+-1：无限等待。
+返回值：返回实际发生事件的个数，-1 表示出错。
+
+注意：
+Edge Triggered (ET) 模式下，fd 必须设置为非阻塞，否则可能漏事件或阻塞。
+水平触发（LT）模式下，事件未处理完会反复通知。
+epoll 只适用于支持异步 I/O 的 fd（如 socket、管道等），普通文件不支持。
+epoll 的事件不会自动删除，需要手动调用 epoll_ctl(DEL) 删除关闭的 fd。
+
+
+
+
+这几个都是同步IO。
